@@ -3,18 +3,60 @@ import mediapipe as mp
 import argparse
 import os
 import json
+import numpy as np
+import subprocess
+import shutil
 from datetime import datetime
 
-def setup_mediapipe():
+def setup_mediapipe(static_image_mode=False, min_confidence=0.7):
     mp_pose = mp.solutions.pose
     pose = mp_pose.Pose(
-        static_image_mode=False,
+        static_image_mode=static_image_mode,
         model_complexity=2,
         enable_segmentation=False,
-        min_detection_confidence=0.5,
-        min_tracking_confidence=0.5
+        smooth_landmarks=True,  # Enable temporal smoothing
+        min_detection_confidence=min_confidence,
+        min_tracking_confidence=min_confidence
     )
     return pose
+
+def convert_to_720p(input_path, output_path):
+    """
+    Converts video to 720p using ffmpeg with high quality settings
+    to preserve details for pose estimation.
+    """
+    if not shutil.which('ffmpeg'):
+        print("Error: ffmpeg is not installed or not in PATH.")
+        return False
+
+    print(f"Converting {input_path} to 720p (High Quality)...")
+    
+    # High quality settings:
+    # - scale=-2:720: Keep aspect ratio, height 720, width divisible by 2
+    # - flags=lanczos: High quality scaling algorithm (sharper than default)
+    # - crf 18: High quality (lower is better, 18 is roughly visually lossless)
+    # - preset slow: Better compression efficiency
+    # - pix_fmt yuv420p: Ensure compatibility
+    command = [
+        'ffmpeg', '-i', input_path,
+        '-vf', 'scale=-2:720:flags=lanczos',
+        '-c:v', 'libx264',
+        '-crf', '18',
+        '-preset', 'slow',
+        '-c:a', 'copy',
+        '-pix_fmt', 'yuv420p',
+        output_path,
+        '-y' # Overwrite if exists
+    ]
+    
+    try:
+        # Run ffmpeg silently (stdout/stderr to PIPE) unless error
+        subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        print(f"Conversion complete: {output_path}")
+        return True
+    except subprocess.CalledProcessError as e:
+        print(f"Error converting video: {e}")
+        return False
 
 def process_video(video_path, output_path, sample_rate=1):
     print(f"Processing video: {video_path}")
@@ -31,7 +73,15 @@ def process_video(video_path, output_path, sample_rate=1):
     
     print(f"Video Info: {width}x{height} @ {fps}fps, {frame_count} frames")
 
-    pose = setup_mediapipe()
+    # Use video mode (static_image_mode=False) if processing every frame (sample_rate=1)
+    # This enables temporal smoothing and tracking, reducing jitter and error.
+    use_video_mode = (sample_rate == 1)
+    if use_video_mode:
+        print("Mode: Video Stream (Smoothing Enabled)")
+    else:
+        print(f"Mode: Static Images (Sample Rate: {sample_rate})")
+
+    pose = setup_mediapipe(static_image_mode=not use_video_mode, min_confidence=0.7)
     
     frames_data = []
     
@@ -44,8 +94,24 @@ def process_video(video_path, output_path, sample_rate=1):
             break
 
         if frame_idx % sample_rate == 0:
+            # Enhance image for better detection on compressed videos
+            # 1. Apply CLAHE (Contrast Limited Adaptive Histogram Equalization)
+            # Convert to LAB color space
+            lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+            l, a, b = cv2.split(lab)
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+            cl = clahe.apply(l)
+            limg = cv2.merge((cl,a,b))
+            image_enhanced = cv2.cvtColor(limg, cv2.COLOR_LAB2BGR)
+
+            # 2. Mild Sharpening to recover edges lost in compression
+            kernel = np.array([[0, -1, 0],
+                               [-1, 5,-1],
+                               [0, -1, 0]])
+            image_enhanced = cv2.filter2D(image_enhanced, -1, kernel)
+
             # Convert the BGR image to RGB.
-            image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            image_rgb = cv2.cvtColor(image_enhanced, cv2.COLOR_BGR2RGB)
             
             # Process
             results = pose.process(image_rgb)
@@ -168,6 +234,7 @@ def main():
     parser.add_argument('input_path', help='Path to the input video file or directory containing mp4 files')
     parser.add_argument('--output', '-o', help='Path to the output markdown file or directory', default=None)
     parser.add_argument('--sample_rate', '-s', type=int, default=1, help='Process every Nth frame (default: 1)')
+    parser.add_argument('--convert-720p', action='store_true', help='Automatically convert video to 720p HQ before processing')
     
     args = parser.parse_args()
     
@@ -188,20 +255,59 @@ def main():
         
         for video_file in video_files:
             video_path = os.path.join(input_path, video_file)
-            # Create output filename: video_name.json
-            output_filename = os.path.splitext(video_file)[0] + ".json"
+            
+            # Handle conversion if requested
+            if args.convert_720p:
+                converted_filename = os.path.splitext(video_file)[0] + "_720p_hq.mp4"
+                converted_path = os.path.join(output_dir, converted_filename)
+                if convert_to_720p(video_path, converted_path):
+                    video_path = converted_path # Use the converted video for processing
+                    # Update output filename to match original name but with json extension
+                    # or keep the _720p suffix if preferred. Let's keep it clean:
+                    output_filename = os.path.splitext(video_file)[0] + ".json"
+                else:
+                    print(f"Skipping {video_file} due to conversion error.")
+                    continue
+            else:
+                output_filename = os.path.splitext(video_file)[0] + ".json"
+
             output_path = os.path.join(output_dir, output_filename)
             process_video(video_path, output_path, args.sample_rate)
             
     else:
         # Single file processing
+        video_path = input_path
+        
         if args.output:
-            output_path = args.output
+            # If output is a directory
+            if os.path.isdir(args.output) or (not os.path.splitext(args.output)[1]):
+                 if not os.path.exists(args.output):
+                     os.makedirs(args.output)
+                 output_dir = args.output
+                 output_filename = os.path.splitext(os.path.basename(input_path))[0] + ".json"
+                 output_path = os.path.join(output_dir, output_filename)
+            else:
+                 output_path = args.output
+                 output_dir = os.path.dirname(output_path)
         else:
             # Default output name if not specified
+            output_dir = os.path.dirname(input_path)
             output_path = os.path.splitext(input_path)[0] + ".json"
+
+        if args.convert_720p:
+            # Determine where to save the converted video
+            # Save it in the same folder as output or input
+            save_dir = output_dir if output_dir else os.path.dirname(input_path)
+            converted_filename = os.path.splitext(os.path.basename(input_path))[0] + "_720p_hq.mp4"
+            converted_path = os.path.join(save_dir, converted_filename)
             
-        process_video(input_path, output_path, args.sample_rate)
+            if convert_to_720p(video_path, converted_path):
+                video_path = converted_path
+            else:
+                print("Conversion failed, aborting.")
+                return
+            
+        process_video(video_path, output_path, args.sample_rate)
 
 if __name__ == "__main__":
     main()
